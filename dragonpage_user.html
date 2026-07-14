@@ -72,9 +72,6 @@ uniform vec2 uRPreX[ITER];   // reference orbit, x, post-rotation/pre-branch (do
 uniform vec2 uRPreY[ITER];   // reference orbit, y, post-rotation (double-single)
 uniform float uDRef[ITER];   // reference orbit's own branch choice (0 or 1) each iteration
 
-// ---------- Double-single (compensated) add -- only add/sub needed,
-// since the twindragon's "rotate" step is pure addition/subtraction. ----------
-
 vec2 twoSum(float a, float b) {
     float s = a + b;
     float bb = s - a;
@@ -90,13 +87,22 @@ vec2 dsAddFloat(vec2 a, float b) {
 
 float dsToFloat(vec2 a) { return a.x + a.y; }
 
-vec3 pal(float t, vec3 a, vec3 b, vec3 c, vec3 d) {
-    return a + b * cos(6.28318 * (c * t + d));
+// ---- color strategy, ported from the time-based zoom version ----
+// 1. Phase = mod(smoothEscape, PERIOD)/PERIOD: a fixed-period cycle so color
+//    bands repeat forever as escape counts grow with zoom depth, instead of
+//    washing out as smoothEscape/ITER would.
+// 2. Hue stays in a NARROW analogous arc (violet->magenta->rose) via HSV
+//    rather than independent R/G/B frequencies, so nothing clashes.
+// 3. Brightness ramps off the RAW escape count (not a fraction of ITER) and
+//    is capped well under 1.0 to stay muted for a large-screen render.
+const float PERIOD = 14.0;
+
+vec3 hsv2rgb(vec3 c) {
+    vec3 p = abs(fract(c.xxx + vec3(1.0, 2.0/3.0, 1.0/3.0)) * 6.0 - 3.0);
+    return c.z * mix(vec3(1.0), clamp(p - 1.0, 0.0, 1.0), c.y);
 }
 
 vec3 dragonColor(vec2 offset) {
-    // eps = this pixel's difference from the reference orbit. Stays small
-    // and precise regardless of how far uPanX/uPanY are from (0,0).
     float epsx = offset.x;
     float epsy = offset.y;
 
@@ -107,26 +113,16 @@ vec3 dragonColor(vec2 offset) {
     for (int i = 0; i < ITER; i++) {
         if (smoothEscape >= 0.0) break;
 
-        // Rotation is exact addition/subtraction -- no precision lost here,
-        // for either the reference or the actual pixel.
         float epx_pre = epsx - epsy;
         float epy_pre = epsx + epsy;
 
-        // Combine the PRECISE reference (double-single) with our tiny eps
-        // to decide which branch THIS pixel actually takes.
         vec2 diff = dsAddFloat(dsAddFloat(uRPreX[i], -0.5), epx_pre);
         bool dActual = (diff.x > 0.0) || (diff.x == 0.0 && diff.y > 0.0);
         float dActualF = dActual ? 1.0 : 0.0;
 
-        // If this pixel's branch differs from the reference orbit's branch
-        // (only happens right at a tile boundary), shift eps by the same
-        // integer amount so it remains a true reference-relative difference.
         epsx = epx_pre - (dActualF - uDRef[i]);
         epsy = epy_pre;
 
-        // Reconstruct approximate absolute position just for the escape
-        // check -- this only needs to be accurate to ~O(1), not deep-zoom
-        // precise, since it's just a "did it cross radius 2" test.
         float rPostX = dsToFloat(uRPreX[i]) - uDRef[i];
         float rPostY = dsToFloat(uRPreY[i]);
         Z = vec2(rPostX + epsx, rPostY + epsy);
@@ -139,32 +135,33 @@ vec3 dragonColor(vec2 offset) {
         prevLen = newLen;
     }
 
-    vec3 interiorBase = pal(0.85,
-        vec3(0.25, 0.08, 0.16), vec3(0.18, 0.08, 0.13),
-        vec3(1.0, 0.7, 0.6), vec3(0.95, 0.55, 0.65));
-
     if (smoothEscape < 0.0) {
-        float texture_ = 0.85 + 0.15 * sin(dot(Z, Z) * 8.0 + Z.x * 5.0);
-        return interiorBase * texture_;
+        float n = 0.5 + 0.5 * sin(dot(Z, Z) * 6.0);
+        return vec3(0.07, 0.05, 0.06) + 0.035 * vec3(n, n * 0.8, n * 0.9);
     }
 
-    float t = smoothEscape / float(ITER);
-    float glow = smoothstep(0.05, 0.35, t);
+    float tCycle = mod(smoothEscape, PERIOD) / PERIOD;
 
-    vec3 boundaryColor = pal(t,
-        vec3(0.7, 0.25, 0.5), vec3(0.4, 0.3, 0.35),
-        vec3(1.0, 0.8, 0.6), vec3(0.9, 0.5, 0.6));
+    float hue = 0.80 + 0.09 * sin(6.28318 * tCycle);
+    float sat = clamp(0.45 + 0.15 * sin(6.28318 * tCycle * 1.5 + 1.0), 0.0, 1.0);
+    float val = clamp(0.16 + 0.10 * sin(6.28318 * tCycle + 0.6), 0.0, 1.0);
+    vec3 base = hsv2rgb(vec3(hue, sat, val));
 
-    vec3 col = mix(boundaryColor, interiorBase, smoothstep(0.6, 0.95, t));
+    float veinFreq = 1.0;
+    float veinSharp = 4.0;
+    float vein = pow(max(cos(6.28318 * veinFreq * tCycle + 1.2), 0.0), veinSharp);
+    vec3 sparkle = hsv2rgb(vec3(hue + 0.02, sat * 0.7, 0.5));
+    vec3 col = base + sparkle * vein * 0.35;
+
+    float glow = 0.8 * smoothstep(1.0, 5.0, smoothEscape)
+               * (1.0 - 0.35 * smoothstep(float(ITER) * 0.9, float(ITER), smoothEscape));
     col *= glow;
-    col = pow(col, vec3(1.3));
+
     return col;
 }
 
 void main() {
     vec2 fragCoord = gl_FragCoord.xy;
-    // Per-pixel offset from view center -- this is eps at iteration 0.
-    // It's always small (screen-sized * zoom), so plain float32 is fine.
     vec2 offset = (fragCoord - 0.5 * iResolution.xy) / iResolution.y * uZoom;
     fragColor = vec4(dragonColor(offset), 1.0);
 }
